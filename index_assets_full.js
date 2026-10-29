@@ -1,6 +1,6 @@
 require("dotenv").config();
 const { chromium } = require("playwright");
-const { mkdirSync, writeFileSync } = require("fs");
+const { mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } = require("fs");
 const path = require("path");
 const readline = require("readline");
 
@@ -71,6 +71,10 @@ if (!CONFIG.username || !CONFIG.password) {
 // output/Fixed Assets - Asset and Doc Details/<OU_FOLDER>/<date>/...
 const OU_FOLDER = deriveOuFolder(CONFIG.ouInstance || DEFAULT_OU_INSTANCE);
 console.log(`📁 Output folder for this run: output/Fixed Assets - Asset and Doc Details/${OU_FOLDER}/`);
+
+// Auto-resume checkpoint: a per-OU file that records every Asset No. already
+// exported, so an interrupted run can be re-launched and skip what it finished.
+const RESUME_FILE = `output/.assets-resume-${OU_FOLDER}.json`;
 
 // ─── MENU PATH ─────────────────────────────────────────────────────────────
 // Fixed Assets → Asset Capitalization → View Asset
@@ -805,6 +809,32 @@ function safeAssetFolder(assetNo) {
   return (assetNo || "UnknownAsset").replace(/[\\/:*?"<>|]/g, "_").trim();
 }
 
+// ─── AUTO-RESUME CHECKPOINT ────────────────────────────────────────────────
+// Keyed by Asset No. (not row index), so a restarted run skips the assets it
+// already exported even if the grid order shifts. The file is deleted once a
+// run completes in full; an interrupted run simply leaves it on disk.
+function loadDoneAssets(file) {
+  try {
+    if (!existsSync(file)) return new Set();
+    const data = JSON.parse(readFileSync(file, "utf8"));
+    return new Set(Array.isArray(data.done) ? data.done : []);
+  } catch (_) { return new Set(); }
+}
+
+function saveDoneAssets(file, doneSet, total) {
+  try {
+    writeFileSync(file, JSON.stringify({
+      updatedAt: new Date().toISOString(),
+      total,
+      done: [...doneSet],
+    }, null, 2));
+  } catch (_) {}
+}
+
+function clearDoneAssets(file) {
+  try { if (existsSync(file)) rmSync(file); } catch (_) {}
+}
+
 /**
  * Reads the Ramco grid pager and returns { start, end, total, raw }.
  *
@@ -1134,7 +1164,14 @@ async function main() {
     const totalPages = Math.max(1, Math.ceil(total / pageSize));
     const startPage = Math.floor((startIndex - 1) / pageSize) + 1;
     const results = [];
-    let done = 0, failed = 0;
+    let done = 0, failed = 0, skipped = 0;
+
+    // Auto-resume: load the Asset Nos. exported by a prior, interrupted run of
+    // this workflow + OU. Matching rows are skipped without drilling in.
+    const doneAssets = loadDoneAssets(RESUME_FILE);
+    if (doneAssets.size) {
+      console.log(`  ↩ Auto-resume: ${doneAssets.size} asset(s) already exported previously — they will be skipped.`);
+    }
 
     outer:
     for (let pageNum = startPage; pageNum <= totalPages; pageNum++) {
@@ -1153,6 +1190,16 @@ async function main() {
 
         // A prior Go back may have moved the grid — make sure we're on this page.
         await ensureOnPage(page, pageNum, pageSize);
+
+        // Auto-resume: read the Asset No. cheaply (no drill-in) and skip the row
+        // if a previous run already exported it.
+        const preAssetNo = (await readAssetNo(page, rowIdx)).trim();
+        if (preAssetNo && doneAssets.has(preAssetNo)) {
+          console.log(`  ↩ Asset ${preAssetNo} already exported previously — skipping.`);
+          results.push({ index: globalIdx, assetNo: preAssetNo, ok: true, skipped: true });
+          skipped++;
+          continue;
+        }
 
         // Steps 4–5: select the row, open View Asset Details.
         const open1 = await selectRowAndOpen(page, rowIdx, "View Asset Details", "Asset Information");
@@ -1233,6 +1280,8 @@ async function main() {
 
         results.push({ index: globalIdx, assetNo, ok: true, tagCount: tagTotal, detailExport, docExports });
         done++;
+        doneAssets.add(assetNo);
+        saveDoneAssets(RESUME_FILE, doneAssets, total);
         console.log(`  ✅ Asset ${assetNo} done — ${docExports.length}/${tagTotal} tag doc export(s)${onList ? "" : " (⚠ list not confirmed)"}.`);
         await page.waitForTimeout(400);
       }
@@ -1240,14 +1289,17 @@ async function main() {
       console.log(`  ✔ Page ${pageNum} complete — all its rows exported.`);
     }
 
+    // Whole grid processed without interruption — drop the resume checkpoint.
+    clearDoneAssets(RESUME_FILE);
+
     const secs = Math.floor((Date.now() - startTime) / 1000);
-    console.log(`\n✅ Finished. Processed ${done} asset(s), ${failed} failed, of ${limit - startIndex + 1} attempted (total in grid: ${total}).`);
+    console.log(`\n✅ Finished. Processed ${done} asset(s), ${failed} failed, ${skipped} skipped (already done), of ${limit - startIndex + 1} attempted (total in grid: ${total}).`);
     if (listExport) console.log(`✅ Search results list → ${listExport}`);
     console.log(`⏱  Total runtime: ${Math.floor(secs / 60)}m ${secs % 60}s`);
 
     try {
       writeFileSync("output/extracted-data-assets.json",
-        JSON.stringify({ total, attempted: limit - startIndex + 1, processed: done, failed, results }, null, 2));
+        JSON.stringify({ total, attempted: limit - startIndex + 1, processed: done, failed, skipped, results }, null, 2));
       console.log("💾 Summary → output/extracted-data-assets.json");
     } catch (_) {}
 
